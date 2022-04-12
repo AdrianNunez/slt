@@ -96,7 +96,9 @@ class Batch:
         if hasattr(torch_batch, "txt"):
             txt, txt_lengths = torch_batch.txt
             # txt_input is used for teacher forcing, last one is cut off
-            self.txt_input = txt[:, :-1]
+            self.txt_input = txt[:, :-1]#.clone()
+            
+            #self.txt_input[self.txt_input==2] = 3
             self.txt_lengths = txt_lengths
             # txt is used for loss computation, shifted by one since BOS
             self.txt = txt[:, 1:]
@@ -108,6 +110,12 @@ class Batch:
             self.gls, self.gls_lengths = torch_batch.gls
             self.num_gls_tokens = self.gls_lengths.sum().detach().clone().numpy()
 
+        self.right_stream, self.right_stream_lengths, self.right_stream_mask = None, None, None
+        if hasattr(torch_batch, "right_stream"):
+            self.right_stream, self.right_stream_lengths = torch_batch.right_stream
+            right_stream_dim = self.right_stream.size(-1)
+            self.right_stream_mask = (self.right_stream != torch.zeros(right_stream_dim))[..., 0].unsqueeze(1)
+       
         if use_cuda:
             self._make_cuda()
 
@@ -124,6 +132,11 @@ class Batch:
             self.txt = self.txt.cuda()
             self.txt_mask = self.txt_mask.cuda()
             self.txt_input = self.txt_input.cuda()
+
+        if self.right_stream is not None:
+            self.right_stream = self.right_stream.cuda()
+            self.right_stream_lengths = self.right_stream_lengths.cuda()
+            self.right_stream_mask = self.right_stream_mask.cuda()
 
     def sort_by_sgn_lengths(self):
         """
@@ -152,6 +165,11 @@ class Batch:
             self.txt_mask = self.txt_mask[perm_index]
             self.txt_input = self.txt_input[perm_index]
             self.txt_lengths = self.txt_lengths[perm_index]
+
+        if self.right_stream is not None:
+            self.right_stream = self.right_stream[perm_index]
+            self.right_stream_lengths = self.right_stream_lengths[perm_index]
+            self.right_stream_mask = self.right_stream_mask[perm_index]
 
         if self.use_cuda:
             self._make_cuda()

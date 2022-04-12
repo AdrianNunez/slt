@@ -25,8 +25,11 @@ class SignTranslationDataset(data.Dataset):
 
     def __init__(
         self,
+        cfg,
         path: str,
-        fields: Tuple[RawField, RawField, Field, Field, Field],
+        tokeniser,
+        fields,
+        field_names,
         **kwargs
     ):
         """Create a SignTranslationDataset given paths and fields.
@@ -40,13 +43,7 @@ class SignTranslationDataset(data.Dataset):
                 data.Dataset.
         """
         if not isinstance(fields[0], (tuple, list)):
-            fields = [
-                ("sequence", fields[0]),
-                ("signer", fields[1]),
-                ("sgn", fields[2]),
-                ("gls", fields[3]),
-                ("txt", fields[4]),
-            ]
+            fields = [(field_names[i], fields[i]) for i in range(len(fields))]
 
         if not isinstance(path, list):
             path = [path]
@@ -72,20 +69,50 @@ class SignTranslationDataset(data.Dataset):
                         "text": s["text"],
                         "sign": s["sign"],
                     }
+                    if "pose" in s:
+                        samples[seq_id]["pose"] = s["pose"]
+                    if "flow" in s:
+                        samples[seq_id]["flow"] = s["flow"]
+
+        normalise_before_concat = cfg["normalise_before_concat"]
 
         examples = []
         for s in samples:
             sample = samples[s]
+            l = [
+                sample["name"],
+                sample["signer"],
+                # This is for numerical stability
+                sample["sign"] + 1e-8,
+                sample["gloss"].strip(),
+                #sample["text"].strip(),
+                tokeniser.encode(sample["text"].strip().lower())
+                if cfg["level"] == "subword" else sample["text"].strip(),
+            ]
+            if cfg["concat_pose"]:
+                l[2] = torch.cat((
+                    torch.nn.functional.normalize(l[2], dim=-1) 
+                    if normalise_before_concat else l[2], 
+                    torch.nn.functional.normalize(sample["pose"], dim=-1)
+                    if normalise_before_concat else sample["pose"]
+                ), dim=1)
+            if cfg["concat_flow"]:
+                #flow = torch.cat((torch.zeros(1, sample["flow"].size(-1)), sample["flow"]), dim=0)
+                flow = torch.cat((sample["flow"][:1,:], sample["flow"]), dim=0)
+                l[2] = torch.cat((
+                    torch.nn.functional.normalize(l[2], dim=-1)
+                    if normalise_before_concat else l[2], 
+                    torch.nn.functional.normalize(flow, dim=-1)
+                    if normalise_before_concat else flow
+                ), dim=1)
+            if cfg["pose_stream"]:
+                l.append(sample["pose"])
+            if cfg["flow_stream"]:
+                flow = torch.cat((torch.zeros(1, sample["flow"].size(-1)), sample["flow"]), dim=0)
+                l.append(flow)
             examples.append(
                 data.Example.fromlist(
-                    [
-                        sample["name"],
-                        sample["signer"],
-                        # This is for numerical stability
-                        sample["sign"] + 1e-8,
-                        sample["gloss"].strip(),
-                        sample["text"].strip(),
-                    ],
+                    l,
                     fields,
                 )
             )

@@ -14,6 +14,7 @@ from torchtext.data import Dataset
 from signjoey.loss import XentLoss
 from signjoey.helpers import (
     bpe_postprocess,
+    subword_postprocess,
     load_config,
     get_latest_checkpoint,
     load_checkpoint,
@@ -27,11 +28,12 @@ from signjoey.phoenix_utils.phoenix_cleanup import (
     clean_phoenix_2014,
     clean_phoenix_2014_trans,
 )
-
+from .tokeniser import Tokeniser
 
 # pylint: disable=too-many-arguments,too-many-locals,no-member
 def validate_on_data(
     model: SignModel,
+    tokeniser,
     data: Dataset,
     batch_size: int,
     use_cuda: bool,
@@ -43,6 +45,9 @@ def validate_on_data(
     translation_loss_function: torch.nn.Module,
     translation_loss_weight: int,
     translation_max_output_length: int,
+    do_pose_estimation: bool,
+    pose_loss_function: torch.nn.Module,
+    pose_loss_weight: int,
     level: str,
     txt_pad_index: int,
     recognition_beam_size: int = 1,
@@ -119,6 +124,7 @@ def validate_on_data(
         all_attention_scores = []
         total_recognition_loss = 0
         total_translation_loss = 0
+        total_pose_loss = 0
         total_num_txt_tokens = 0
         total_num_gls_tokens = 0
         total_num_seqs = 0
@@ -131,9 +137,10 @@ def validate_on_data(
                 use_cuda=use_cuda,
                 frame_subsampling_ratio=frame_subsampling_ratio,
             )
+           
             sort_reverse_index = batch.sort_by_sgn_lengths()
-
-            batch_recognition_loss, batch_translation_loss = model.get_loss_for_batch(
+            
+            batch_recognition_loss, batch_translation_loss, batch_pose_loss = model.get_loss_for_batch(
                 batch=batch,
                 recognition_loss_function=recognition_loss_function
                 if do_recognition
@@ -141,11 +148,17 @@ def validate_on_data(
                 translation_loss_function=translation_loss_function
                 if do_translation
                 else None,
+                pose_loss_function=pose_loss_function
+                if do_pose_estimation
+                else None,
                 recognition_loss_weight=recognition_loss_weight
                 if do_recognition
                 else None,
                 translation_loss_weight=translation_loss_weight
                 if do_translation
+                else None,
+                pose_loss_weight=pose_loss_weight
+                if do_pose_estimation
                 else None,
             )
             if do_recognition:
@@ -154,6 +167,8 @@ def validate_on_data(
             if do_translation:
                 total_translation_loss += batch_translation_loss
                 total_num_txt_tokens += batch.num_txt_tokens
+            if do_pose_estimation:
+                total_pose_loss += batch_pose_loss
             total_num_seqs += batch.num_seqs
 
             (
@@ -233,18 +248,35 @@ def validate_on_data(
             # evaluate with metric on full dataset
             join_char = " " if level in ["word", "bpe"] else ""
             # Construct text sequences for metrics
-            txt_ref = [join_char.join(t) for t in data.txt]
-            txt_hyp = [join_char.join(t) for t in decoded_txt]
+            if level == 'subword':
+                txt_ref = [join_char.join(tokeniser.decode([int(elem) for elem in t])) for t in data.txt]
+                txt_hyp = [join_char.join(t) for t in decoded_txt]
+            else:
+                txt_ref = [join_char.join(t) for t in data.txt]
+                txt_hyp = [join_char.join(t) for t in decoded_txt]
             # post-process
             if level == "bpe":
                 txt_ref = [bpe_postprocess(v) for v in txt_ref]
                 txt_hyp = [bpe_postprocess(v) for v in txt_hyp]
+            elif level == "subword":
+                txt_ref = [subword_postprocess(v) for v in txt_ref]
+                txt_hyp = [subword_postprocess(v) for v in txt_hyp]
             assert len(txt_ref) == len(txt_hyp)
 
             # TXT Metrics
             txt_bleu = bleu(references=txt_ref, hypotheses=txt_hyp)
             txt_chrf = chrf(references=txt_ref, hypotheses=txt_hyp)
             txt_rouge = rouge(references=txt_ref, hypotheses=txt_hyp)
+
+        if do_pose_estimation:
+            if (
+                pose_loss_function is not None
+                and pose_loss_weight != 0
+            ):
+                # total validation pose loss
+                valid_pose_loss = total_pose_loss
+            else:
+                valid_pose_loss = -1
 
         valid_scores = {}
         if do_recognition:
@@ -255,7 +287,7 @@ def validate_on_data(
             valid_scores["bleu_scores"] = txt_bleu
             valid_scores["chrf"] = txt_chrf
             valid_scores["rouge"] = txt_rouge
-
+        
     results = {
         "valid_scores": valid_scores,
         "all_attention_scores": all_attention_scores,
@@ -272,6 +304,9 @@ def validate_on_data(
         results["decoded_txt"] = decoded_txt
         results["txt_ref"] = txt_ref
         results["txt_hyp"] = txt_hyp
+
+    if do_pose_estimation:
+        results["valid_pose_loss"] = valid_pose_loss
 
     return results
 
@@ -320,8 +355,12 @@ def test(
         "translation_max_output_length", None
     )
 
+    tokeniser = Tokeniser(cfg['data'])
+
     # load the data
-    _, dev_data, test_data, gls_vocab, txt_vocab = load_data(data_cfg=cfg["data"])
+    _, dev_data, test_data, gls_vocab, txt_vocab = load_data(
+        data_cfg=cfg["data"], tokeniser=tokeniser
+    )
 
     # load model state from disk
     model_checkpoint = load_checkpoint(ckpt, use_cuda=use_cuda)
@@ -329,15 +368,39 @@ def test(
     # build model and load parameters into it
     do_recognition = cfg["training"].get("recognition_loss_weight", 1.0) > 0.0
     do_translation = cfg["training"].get("translation_loss_weight", 1.0) > 0.0
+    do_pose_estimation = cfg["training"].get("pose_loss_weight", 1.0) > 0.0
+
+    sgn_dim = (
+        sum(cfg["data"]["feature_size"])
+        if isinstance(cfg["data"]["feature_size"], list)
+        else cfg["data"]["feature_size"]
+    )
+    if cfg["data"]["concat_pose"]:
+        sgn_dim += (
+            sum(cfg["data"]["pose_size"])
+            if isinstance(cfg["data"]["pose_size"], list)
+            else cfg["data"]["pose_size"]
+        )
+    if cfg["data"]["concat_flow"]:
+        sgn_dim += (
+            sum(cfg["data"]["flow_size"])
+            if isinstance(cfg["data"]["flow_size"], list)
+            else cfg["data"]["flow_size"]
+        )
+    right_stream_dim = None
+    if cfg["data"]["pose_stream"]:
+        right_stream_dim = cfg["data"]["pose_size"]
+    elif cfg["data"]["flow_stream"]:
+        right_stream_dim = cfg["data"]["flow_size"]
     model = build_model(
         cfg=cfg["model"],
         gls_vocab=gls_vocab,
         txt_vocab=txt_vocab,
-        sgn_dim=sum(cfg["data"]["feature_size"])
-        if isinstance(cfg["data"]["feature_size"], list)
-        else cfg["data"]["feature_size"],
+        sgn_dim=sgn_dim,
         do_recognition=do_recognition,
         do_translation=do_translation,
+        do_pose_estimation=do_pose_estimation,
+        right_stream_dim=right_stream_dim
     )
     model.load_state_dict(model_checkpoint["model_state"])
 
@@ -359,6 +422,24 @@ def test(
         translation_beam_sizes = [1]
         translation_beam_alphas = [-1]
 
+    sgn_dim = (
+        sum(cfg["data"]["feature_size"])
+        if isinstance(cfg["data"]["feature_size"], list)
+        else cfg["data"]["feature_size"]
+    )
+    if cfg["data"]["concat_pose"]:
+        sgn_dim += (
+            sum(cfg["data"]["pose_size"])
+            if isinstance(cfg["data"]["pose_size"], list)
+            else cfg["data"]["pose_size"]
+        )
+    if cfg["data"]["concat_flow"]:
+        sgn_dim += (
+            sum(cfg["data"]["flow_size"])
+            if isinstance(cfg["data"]["flow_size"], list)
+            else cfg["data"]["flow_size"]
+        )
+
     if "testing" in cfg.keys():
         max_recognition_beam_size = cfg["testing"].get(
             "max_recognition_beam_size", None
@@ -378,6 +459,13 @@ def test(
         )
         if use_cuda:
             translation_loss_function.cuda()
+    if do_pose_estimation:
+        #pose_loss_function = torch.nn.MSELoss(reduction='sum')
+        def pose_loss_function(x, y):
+            loss = torch.nn.functional.mse_loss(x, y, reduction='none')
+            return loss[y!=0].mean()
+        """ if use_cuda:
+            pose_loss_function.cuda() """
 
     # NOTE (Cihan): Currently Hardcoded to be 0 for TensorFlow decoding
     assert model.gls_vocab.stoi[SIL_TOKEN] == 0
@@ -393,14 +481,13 @@ def test(
             logger.info("[DEV] partition [RECOGNITION] experiment [BW]: %d", rbw)
             dev_recognition_results[rbw] = validate_on_data(
                 model=model,
+                tokeniser=tokeniser,
                 data=dev_data,
                 batch_size=batch_size,
                 use_cuda=use_cuda,
                 batch_type=batch_type,
                 dataset_version=dataset_version,
-                sgn_dim=sum(cfg["data"]["feature_size"])
-                if isinstance(cfg["data"]["feature_size"], list)
-                else cfg["data"]["feature_size"],
+                sgn_dim=sgn_dim,
                 txt_pad_index=txt_vocab.stoi[PAD_TOKEN],
                 # Recognition Parameters
                 do_recognition=do_recognition,
@@ -416,6 +503,11 @@ def test(
                 translation_max_output_length=translation_max_output_length
                 if do_translation
                 else None,
+                do_pose_estimation=do_pose_estimation,
+                pose_loss_function=pose_loss_function
+                if do_pose_estimation 
+                else None,
+                pose_loss_weight=1 if do_pose_estimation else None,
                 level=level if do_translation else None,
                 translation_beam_size=1 if do_translation else None,
                 translation_beam_alpha=-1 if do_translation else None,
@@ -456,13 +548,12 @@ def test(
             for ta in translation_beam_alphas:
                 dev_translation_results[tbw][ta] = validate_on_data(
                     model=model,
+                    tokeniser=tokeniser,
                     data=dev_data,
                     batch_size=batch_size,
                     use_cuda=use_cuda,
                     level=level,
-                    sgn_dim=sum(cfg["data"]["feature_size"])
-                    if isinstance(cfg["data"]["feature_size"], list)
-                    else cfg["data"]["feature_size"],
+                    sgn_dim=sgn_dim,
                     batch_type=batch_type,
                     dataset_version=dataset_version,
                     do_recognition=do_recognition,
@@ -475,6 +566,9 @@ def test(
                     translation_loss_function=translation_loss_function,
                     translation_loss_weight=1,
                     translation_max_output_length=translation_max_output_length,
+                    do_pose_estimation=do_pose_estimation,
+                    pose_loss_function=pose_loss_function if do_pose_estimation else None,
+                    pose_loss_weight=1 if do_pose_estimation else None,
                     txt_pad_index=txt_vocab.stoi[PAD_TOKEN],
                     translation_beam_size=tbw,
                     translation_beam_alpha=ta,
@@ -559,14 +653,13 @@ def test(
 
     test_best_result = validate_on_data(
         model=model,
+        tokeniser=tokeniser,
         data=test_data,
         batch_size=batch_size,
         use_cuda=use_cuda,
         batch_type=batch_type,
         dataset_version=dataset_version,
-        sgn_dim=sum(cfg["data"]["feature_size"])
-        if isinstance(cfg["data"]["feature_size"], list)
-        else cfg["data"]["feature_size"],
+        sgn_dim=sgn_dim,
         txt_pad_index=txt_vocab.stoi[PAD_TOKEN],
         do_recognition=do_recognition,
         recognition_loss_function=recognition_loss_function if do_recognition else None,
@@ -580,6 +673,9 @@ def test(
         translation_max_output_length=translation_max_output_length
         if do_translation
         else None,
+        do_pose_estimation=do_pose_estimation,
+        pose_loss_function=pose_loss_function if do_pose_estimation else None,
+        pose_loss_weight=1 if do_pose_estimation else None,
         level=level if do_translation else None,
         translation_beam_size=dev_best_translation_beam_size
         if do_translation

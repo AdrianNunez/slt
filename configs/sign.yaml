@@ -5,15 +5,25 @@ data:
     sgn: sign
     txt: text
     gls: gloss
-    train: PHOENIX2014T/phoenix14t.pami0.train
-    dev: PHOENIX2014T/phoenix14t.pami0.dev
-    test: PHOENIX2014T/phoenix14t.pami0.test
+    train: PHOENIX2014T/phoenix14t_3d_train_2
+    dev: PHOENIX2014T/phoenix14t_3d_dev_2
+    test: PHOENIX2014T/phoenix14t_3d_test_2
     feature_size: 1024
+    pose_size: 132
+    flow_size: 1024
     level: word
     txt_lowercase: true
     max_sent_length: 400
     random_train_subset: -1
     random_dev_subset: -1
+    tokeniser_path: data/tokeniser/tok.model
+    txt_vocab: data/vocabulary.txt
+    tokeniser_file: ../mbart.cc25.v2/sentence.bpe.model
+    pose_stream: false
+    flow_stream: false
+    concat_pose: false
+    concat_flow: false
+    normalise_before_concat: false
 testing:
     recognition_beam_sizes:
     - 1
@@ -45,6 +55,7 @@ testing:
     - 3
     - 4
     - 5
+
 training:
     reset_best_ckpt: false
     reset_scheduler: false
@@ -53,10 +64,12 @@ training:
     model_dir: "./sign_sample_model"
     recognition_loss_weight: 1.0
     translation_loss_weight: 1.0
+    pose_loss_weight: 0.0
     eval_metric: bleu
     optimizer: adam
     learning_rate: 0.001
     batch_size: 32
+    eval_batch_size: 128
     num_valid_log: 5
     epochs: 5000000
     early_stopping_metric: eval_metric
@@ -73,7 +86,7 @@ training:
     batch_multiplier: 1
     logging_freq: 100
     validation_freq: 100
-    betas:
+    betas:  
     - 0.9
     - 0.998
     scheduling: plateau
@@ -81,14 +94,17 @@ training:
     weight_decay: 0.001
     patience: 8
     decrease_factor: 0.7
-    label_smoothing: 0.0
+    label_smoothing: 0
 model:
     initializer: xavier
     bias_initializer: zeros
     init_gain: 1.0
     embed_initializer: xavier
     embed_init_gain: 1.0
-    tied_softmax: false
+    tied_softmax: false 
+    pretrained_embeddings: false
+    pretrained_embeddings_path: "data/embedding_table.npy"
+    freeze_embeddings: false
     encoder:
         type: transformer
         num_layers: 3
@@ -99,9 +115,11 @@ model:
             dropout: 0.1
             norm_type: batch
             activation_type: softsign
+            low_rank_approximation: false
         hidden_size: 512
         ff_size: 2048
         dropout: 0.1
+        pose_output_dim: 132
     decoder:
         type: transformer
         num_layers: 3

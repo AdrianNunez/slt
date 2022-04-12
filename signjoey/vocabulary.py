@@ -44,7 +44,11 @@ class Vocabulary:
         tokens = []
         with open(file, "r", encoding="utf-8") as open_file:
             for line in open_file:
-                tokens.append(line.strip("\n"))
+                l = line.strip("\n").split('\t')
+                if len(l) > 1:
+                    tokens.append(l[1])
+                else:
+                    tokens.append(line.strip("\n"))
         self._from_list(tokens)
 
     def __str__(self) -> str:
@@ -98,7 +102,7 @@ class TextVocabulary(Vocabulary):
         :param file: file to load vocabulary from
         """
         super().__init__()
-        self.specials = [UNK_TOKEN, PAD_TOKEN, BOS_TOKEN, EOS_TOKEN]
+        self.specials = [UNK_TOKEN, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN]
         self.DEFAULT_UNK_ID = lambda: 0
         self.stoi = defaultdict(self.DEFAULT_UNK_ID)
 

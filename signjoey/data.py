@@ -20,8 +20,7 @@ from signjoey.vocabulary import (
     PAD_TOKEN,
 )
 
-
-def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabulary):
+def load_data(data_cfg: dict, tokeniser) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabulary):
     """
     Load train, dev and optionally test data as specified in configuration.
     Vocabularies are created from the training set with a limit of `voc_limit`
@@ -54,16 +53,37 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         dev_paths = [os.path.join(data_path, x) for x in data_cfg["dev"]]
         test_paths = [os.path.join(data_path, x) for x in data_cfg["test"]]
         pad_feature_size = sum(data_cfg["feature_size"])
-
+        concat_pose = sum(data_cfg["concat_pose"])
+        concat_flow = sum(data_cfg["concat_flow"])
     else:
         train_paths = os.path.join(data_path, data_cfg["train"])
         dev_paths = os.path.join(data_path, data_cfg["dev"])
         test_paths = os.path.join(data_path, data_cfg["test"])
         pad_feature_size = data_cfg["feature_size"]
+        concat_pose = data_cfg["concat_pose"]
+        concat_flow = data_cfg["concat_flow"]
+
+    assert not (data_cfg["pose_stream"] and data_cfg["flow_stream"]) 
+    right_stream_pad_feature_size = None
+    if data_cfg["pose_stream"]:
+        right_stream_pad_feature_size = data_cfg["pose_size"]
+    elif data_cfg["flow_stream"]:
+        right_stream_pad_feature_size = data_cfg["flow_size"]
+
+    if concat_pose:
+        pad_feature_size += data_cfg["pose_size"]
+    if concat_flow:
+        pad_feature_size += data_cfg["flow_size"]
 
     level = data_cfg["level"]
     txt_lowercase = data_cfg["txt_lowercase"]
     max_sent_length = data_cfg["max_sent_length"]
+
+    """ tokeniser_path = data_cfg["tokeniser_path"]
+
+    tokeniser = spm.SentencePieceProcessor()
+    tokeniser.Load(tokeniser_path) """
+    
 
     def tokenize_text(text):
         if level == "char":
@@ -77,6 +97,9 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
 
     # NOTE (Cihan): The something was necessary to match the function signature.
     def stack_features(features, something):
+        """ print(features)
+        print(torch.stack(features[0], dim=0).shape)
+        sys.exit() """
         return torch.stack([torch.stack(ft, dim=0) for ft in features], dim=0)
 
     sequence_field = data.RawField()
@@ -102,7 +125,25 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         include_lengths=True,
     )
 
+    _bos_token = None
+    if level == 'subword':
+        _bos_token = tokeniser.bos_id()
+    else:
+        _bos_token = BOS_TOKEN
+    
     txt_field = data.Field(
+        use_vocab=not level == 'subword',
+        init_token=_bos_token,
+        eos_token=tokeniser.eos_id() if level == 'subword' else EOS_TOKEN,
+        pad_token=tokeniser.pad_id() if level == 'subword' else PAD_TOKEN,
+        tokenize=tokenize_text,
+        unk_token=tokeniser.unk_id() if level == 'subword' else UNK_TOKEN,
+        batch_first=True,
+        lower=None if level == 'subword' else txt_lowercase,
+        include_lengths=True,
+    )
+
+    """ txt_field = data.Field(
         init_token=BOS_TOKEN,
         eos_token=EOS_TOKEN,
         pad_token=PAD_TOKEN,
@@ -111,13 +152,35 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         batch_first=True,
         lower=txt_lowercase,
         include_lengths=True,
-    )
+    ) """
+
+    if data_cfg["pose_stream"] or data_cfg["flow_stream"]: 
+        right_stream_field = data.Field(
+            use_vocab=False,
+            dtype=torch.float32,
+            preprocessing=tokenize_features,
+            batch_first=True,
+            postprocessing=stack_features,
+            include_lengths=True,
+            pad_token=torch.zeros((right_stream_pad_feature_size,)),
+        )
+
+    fields = (sequence_field, signer_field, sgn_field, gls_field, txt_field)
+    field_names = ("sequence", "signer", "sgn", "gls", "txt")
+
+    if data_cfg["pose_stream"] or data_cfg["flow_stream"]:
+        fields += (right_stream_field,)
+        field_names += ("right_stream",)
 
     train_data = SignTranslationDataset(
+        cfg=data_cfg,
         path=train_paths,
-        fields=(sequence_field, signer_field, sgn_field, gls_field, txt_field),
+        tokeniser=tokeniser,
+        fields=fields,
+        field_names=field_names,
         filter_pred=lambda x: len(vars(x)["sgn"]) <= max_sent_length
-        and len(vars(x)["txt"]) <= max_sent_length,
+        and len(vars(x)["txt"]) <= max_sent_length
+        #and vars(x)["pose"] != torch.zeros_like(vars(x)["pose"]),
     )
 
     gls_max_size = data_cfg.get("gls_voc_limit", sys.maxsize)
@@ -140,8 +203,9 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         min_freq=txt_min_freq,
         max_size=txt_max_size,
         dataset=train_data,
-        vocab_file=txt_vocab_file,
+        vocab_file=txt_vocab_file if level == 'subword' else None,
     )
+    
     random_train_subset = data_cfg.get("random_train_subset", -1)
     if random_train_subset > -1:
         # select this many training examples randomly and discard the rest
@@ -152,8 +216,11 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
         train_data = keep
 
     dev_data = SignTranslationDataset(
+        cfg=data_cfg,
         path=dev_paths,
-        fields=(sequence_field, signer_field, sgn_field, gls_field, txt_field),
+        tokeniser=tokeniser,
+        fields=fields,
+        field_names=field_names
     )
     random_dev_subset = data_cfg.get("random_dev_subset", -1)
     if random_dev_subset > -1:
@@ -166,8 +233,11 @@ def load_data(data_cfg: dict) -> (Dataset, Dataset, Dataset, Vocabulary, Vocabul
 
     # check if target exists
     test_data = SignTranslationDataset(
+        cfg=data_cfg,
         path=test_paths,
-        fields=(sequence_field, signer_field, sgn_field, gls_field, txt_field),
+        tokeniser=tokeniser,
+        fields=fields,
+        field_names=field_names
     )
 
     gls_field.vocab = gls_vocab

@@ -5,6 +5,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from signjoey.helpers import freeze_params
 
+from .low_rank_approximation import low_rank_approximation
 
 def get_activation(activation_type):
     if activation_type == "relu":
@@ -139,7 +140,7 @@ class Embeddings(nn.Module):
         :param x: index in the vocabulary
         :return: embedded representation for `x`
         """
-
+        
         x = self.lut(x)
 
         if self.norm_type:
@@ -193,6 +194,7 @@ class SpatialEmbeddings(nn.Module):
 
         self.embedding_dim = embedding_dim
         self.input_size = input_size
+        self.low_rank_approximation = kwargs['low_rank_approximation']
         self.ln = nn.Linear(self.input_size, self.embedding_dim)
 
         self.norm_type = norm_type
@@ -232,9 +234,12 @@ class SpatialEmbeddings(nn.Module):
             x = self.activation(x)
 
         if self.scale:
-            return x * self.scale_factor
-        else:
-            return x
+            x = x * self.scale_factor
+        
+        if self.low_rank_approximation:
+            x = low_rank_approximation(x)
+
+        return x
 
     def __repr__(self):
         return "%s(embedding_dim=%d, input_size=%d)" % (

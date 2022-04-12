@@ -6,7 +6,7 @@ from torch import Tensor
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from signjoey.helpers import freeze_params
-from signjoey.transformer_layers import TransformerEncoderLayer, PositionalEncoding
+from signjoey.transformer_layers import TransformerEncoderLayer, PositionalEncoding, Gaussian_Position
 
 
 # pylint: disable=abstract-method
@@ -237,6 +237,7 @@ class TransformerEncoder(Encoder):
 
         for layer in self.layers:
             x = layer(x, mask)
+
         return self.layer_norm(x), None
 
     def __repr__(self):
@@ -244,4 +245,99 @@ class TransformerEncoder(Encoder):
             self.__class__.__name__,
             len(self.layers),
             self.layers[0].src_src_att.num_heads,
+        )
+
+class TwoStreamTransformerEncoder(Encoder):
+    """
+    Transformer Encoder
+    """
+
+    # pylint: disable=unused-argument
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        ff_size: int = 2048,
+        num_layers: int = 8,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        emb_dropout: float = 0.1,
+        freeze: bool = False,
+        **kwargs
+    ):
+        """
+        Initializes the Transformer.
+        :param hidden_size: hidden size and size of embeddings
+        :param ff_size: position-wise feed-forward layer size.
+          (Typically this is 2*hidden_size.)
+        :param num_layers: number of layers
+        :param num_heads: number of heads for multi-headed attention
+        :param dropout: dropout probability for Transformer layers
+        :param emb_dropout: Is applied to the input (word embeddings).
+        :param freeze: freeze the parameters of the encoder during training
+        :param kwargs:
+        """
+        super(TwoStreamTransformerEncoder, self).__init__()
+
+        layers = []
+        self.left_encoder = TransformerEncoder(
+            hidden_size,
+            ff_size,
+            num_layers,
+            num_heads,
+            dropout,
+            emb_dropout,
+            freeze,
+            **kwargs
+        )
+        layers.append(self.left_encoder)
+        self.right_encoder = TransformerEncoder(
+            hidden_size,
+            ff_size,
+            num_layers,
+            num_heads,
+            dropout,
+            emb_dropout,
+            freeze,
+            **kwargs
+        )
+        layers.append(self.right_encoder)
+
+        self.layers = nn.ModuleList(layers)
+        self._output_size = hidden_size
+
+        if freeze:
+            freeze_params(self)
+
+    # pylint: disable=arguments-differ
+    def forward(
+        self, left_embed_src: Tensor, left_src_length: Tensor, left_mask: Tensor,
+        right_embed_src: Tensor, right_src_length: Tensor, right_mask: Tensor
+    ) -> (Tensor, Tensor):
+        """
+        Pass the input (and mask) through each layer in turn.
+        Applies a Transformer encoder to sequence of embeddings x.
+        The input mini-batch x needs to be sorted by src length.
+        x and mask should have the same dimensions [batch, time, dim].
+
+        :param embed_src: embedded src inputs,
+            shape (batch_size, src_len, embed_size)
+        :param src_length: length of src inputs
+            (counting tokens before padding), shape (batch_size)
+        :param mask: indicates padding areas (zeros where padding), shape
+            (batch_size, src_len, embed_size)
+        :return:
+            - output: hidden states with
+                shape (batch_size, max_length, directions*hidden),
+            - hidden_concat: last hidden state with
+                shape (batch_size, directions*hidden)
+        """
+        left = self.left_encoder(left_embed_src, left_src_length, left_mask)[0]
+        right = self.right_encoder(right_embed_src, right_src_length, right_mask)[0]
+        out = torch.add(left, right)
+        return out, None
+
+    def __repr__(self):
+        return 'Two-stream Encoder:\n{}\n{}'.format(
+            str(self.left_encoder), 
+            str(self.right_encoder)
         )

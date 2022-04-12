@@ -3,6 +3,7 @@ import tensorflow as tf
 
 tf.config.set_visible_devices([], "GPU")
 
+import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +11,7 @@ import torch.nn.functional as F
 from itertools import groupby
 from signjoey.initialization import initialize_model
 from signjoey.embeddings import Embeddings, SpatialEmbeddings
-from signjoey.encoders import Encoder, RecurrentEncoder, TransformerEncoder
+from signjoey.encoders import Encoder, RecurrentEncoder, TransformerEncoder, TwoStreamTransformerEncoder
 from signjoey.decoders import Decoder, RecurrentDecoder, TransformerDecoder
 from signjoey.search import beam_search, greedy
 from signjoey.vocabulary import (
@@ -35,6 +36,7 @@ class SignModel(nn.Module):
         self,
         encoder: Encoder,
         gloss_output_layer: nn.Module,
+        pose_output_layer: nn.Module,
         decoder: Decoder,
         sgn_embed: SpatialEmbeddings,
         txt_embed: Embeddings,
@@ -42,6 +44,8 @@ class SignModel(nn.Module):
         txt_vocab: TextVocabulary,
         do_recognition: bool = True,
         do_translation: bool = True,
+        do_pose_estimation: bool = False,
+        right_stream_embed: nn.Module = None
     ):
         """
         Create a new encoder-decoder model
@@ -61,6 +65,7 @@ class SignModel(nn.Module):
         self.decoder = decoder
 
         self.sgn_embed = sgn_embed
+        self.right_stream_embed = right_stream_embed
         self.txt_embed = txt_embed
 
         self.gls_vocab = gls_vocab
@@ -71,8 +76,10 @@ class SignModel(nn.Module):
         self.txt_eos_index = self.txt_vocab.stoi[EOS_TOKEN]
 
         self.gloss_output_layer = gloss_output_layer
+        self.pose_output_layer = pose_output_layer
         self.do_recognition = do_recognition
         self.do_translation = do_translation
+        self.do_pose_estimation = do_pose_estimation
 
     # pylint: disable=arguments-differ
     def forward(
@@ -82,6 +89,9 @@ class SignModel(nn.Module):
         sgn_lengths: Tensor,
         txt_input: Tensor,
         txt_mask: Tensor = None,
+        right_stream: Tensor = None,
+        right_stream_mask: Tensor = None,
+        right_stream_lengths: Tensor = None,
     ) -> (Tensor, Tensor, Tensor, Tensor):
         """
         First encodes the source sentence.
@@ -95,9 +105,11 @@ class SignModel(nn.Module):
         :return: decoder outputs
         """
         encoder_output, encoder_hidden = self.encode(
-            sgn=sgn, sgn_mask=sgn_mask, sgn_length=sgn_lengths
+            sgn=sgn, sgn_mask=sgn_mask, sgn_length=sgn_lengths,
+            right_stream=right_stream, right_stream_mask=right_stream_mask,
+            right_stream_length=right_stream_lengths,
         )
-
+        
         if self.do_recognition:
             # Gloss Recognition Part
             # N x T x C
@@ -122,10 +134,18 @@ class SignModel(nn.Module):
         else:
             decoder_outputs = None
 
-        return decoder_outputs, gloss_probabilities
+        if self.do_pose_estimation:
+            # N x T x C
+            pose_scores = self.pose_output_layer(encoder_output)
+        else:
+            pose_scores = None
+
+        return decoder_outputs, gloss_probabilities, pose_scores
 
     def encode(
-        self, sgn: Tensor, sgn_mask: Tensor, sgn_length: Tensor
+        self, sgn: Tensor, sgn_mask: Tensor, sgn_length: Tensor,
+        right_stream: Tensor = None, right_stream_mask: Tensor = None,
+        right_stream_length: Tensor = None
     ) -> (Tensor, Tensor):
         """
         Encodes the source sentence.
@@ -135,11 +155,21 @@ class SignModel(nn.Module):
         :param sgn_length:
         :return: encoder outputs (output, hidden_concat)
         """
-        return self.encoder(
-            embed_src=self.sgn_embed(x=sgn, mask=sgn_mask),
-            src_length=sgn_length,
-            mask=sgn_mask,
-        )
+        if right_stream is not None:
+            return self.encoder(
+                left_embed_src=self.sgn_embed(x=sgn, mask=sgn_mask),
+                left_src_length=sgn_length,
+                left_mask=sgn_mask,
+                right_embed_src=self.right_stream_embed(x=right_stream, mask=right_stream_mask),
+                right_src_length=right_stream_length,
+                right_mask=right_stream_mask,
+            )
+        else:
+            return self.encoder(
+                embed_src=self.sgn_embed(x=sgn, mask=sgn_mask),
+                src_length=sgn_length,
+                mask=sgn_mask,
+            )
 
     def decode(
         self,
@@ -178,8 +208,10 @@ class SignModel(nn.Module):
         batch: Batch,
         recognition_loss_function: nn.Module,
         translation_loss_function: nn.Module,
+        pose_loss_function: nn.Module,
         recognition_loss_weight: float,
         translation_loss_weight: float,
+        pose_loss_weight: float,
     ) -> (Tensor, Tensor):
         """
         Compute non-normalized loss and number of tokens for a batch
@@ -195,12 +227,15 @@ class SignModel(nn.Module):
         # pylint: disable=unused-variable
 
         # Do a forward pass
-        decoder_outputs, gloss_probabilities = self.forward(
+        decoder_outputs, gloss_probabilities, pose_scores = self.forward(
             sgn=batch.sgn,
             sgn_mask=batch.sgn_mask,
             sgn_lengths=batch.sgn_lengths,
             txt_input=batch.txt_input,
             txt_mask=batch.txt_mask,
+            right_stream=batch.right_stream,
+            right_stream_mask=batch.right_stream_mask,
+            right_stream_lengths=batch.right_stream_lengths,
         )
 
         if self.do_recognition:
@@ -230,7 +265,17 @@ class SignModel(nn.Module):
         else:
             translation_loss = None
 
-        return recognition_loss, translation_loss
+        if self.do_pose_estimation:
+            assert pose_scores is not None
+            pose_loss = (
+                pose_loss_function(pose_scores, batch.pose) 
+                * pose_loss_weight
+            )
+            #pose_loss = torch.sum(pose_losses != -1)
+        else:
+            pose_loss = None
+
+        return recognition_loss, translation_loss, pose_loss
 
     def run_batch(
         self,
@@ -255,7 +300,9 @@ class SignModel(nn.Module):
         """
 
         encoder_output, encoder_hidden = self.encode(
-            sgn=batch.sgn, sgn_mask=batch.sgn_mask, sgn_length=batch.sgn_lengths
+            sgn=batch.sgn, sgn_mask=batch.sgn_mask, sgn_length=batch.sgn_lengths,
+            right_stream=batch.right_stream, right_stream_mask=batch.right_stream_mask,
+            right_stream_length=batch.right_stream_lengths
         )
 
         if self.do_recognition:
@@ -325,6 +372,17 @@ class SignModel(nn.Module):
         else:
             stacked_txt_output = stacked_attention_scores = None
 
+        if self.do_pose_estimation:
+            pose_scores = self.pose_output_layer(encoder_output)
+            """ pose_losses = (
+                torch.nn.functional.mse_loss(pose_scores, batch.pose) 
+            ) """
+            loss = torch.nn.functional.mse_loss(pose_scores, batch.pose, reduction='none')
+            pose_loss = loss[batch.pose!=0].mean()
+            #pose_loss = torch.sum(pose_losses != -1)
+        else:
+            pose_loss = None
+
         return decoded_gloss_sequences, stacked_txt_output, stacked_attention_scores
 
     def __repr__(self) -> str:
@@ -356,6 +414,8 @@ def build_model(
     txt_vocab: TextVocabulary,
     do_recognition: bool = True,
     do_translation: bool = True,
+    do_pose_estimation: bool = False,
+    right_stream_dim: int = None
 ) -> SignModel:
     """
     Build and initialize the model according to the configuration.
@@ -376,11 +436,30 @@ def build_model(
         num_heads=cfg["encoder"]["num_heads"],
         input_size=sgn_dim,
     )
+    right_stream_embed = None
+    if cfg["encoder"]["type"] == "two_stream":
+        assert right_stream_dim is not None
+        right_stream_embed: SpatialEmbeddings = SpatialEmbeddings(
+            **cfg["encoder"]["embeddings"],
+            num_heads=cfg["encoder"]["num_heads"],
+            input_size=right_stream_dim,
+        )
 
     # build encoder
     enc_dropout = cfg["encoder"].get("dropout", 0.0)
     enc_emb_dropout = cfg["encoder"]["embeddings"].get("dropout", enc_dropout)
-    if cfg["encoder"].get("type", "recurrent") == "transformer":
+    if cfg["encoder"].get("type", "recurrent") == "two_stream":
+        assert (
+            cfg["encoder"]["embeddings"]["embedding_dim"]
+            == cfg["encoder"]["hidden_size"]
+        ), "for transformer, emb_size must be hidden_size"
+
+        encoder = TwoStreamTransformerEncoder(
+            **cfg["encoder"],
+            emb_size=sgn_embed.embedding_dim,
+            emb_dropout=enc_emb_dropout,
+        )
+    elif cfg["encoder"].get("type", "recurrent") == "transformer":
         assert (
             cfg["encoder"]["embeddings"]["embedding_dim"]
             == cfg["encoder"]["hidden_size"]
@@ -435,9 +514,17 @@ def build_model(
         txt_embed = None
         decoder = None
 
+    if do_pose_estimation:
+        pose_output_layer = nn.Linear(encoder.output_size, cfg["encoder"]["pose_output_dim"])
+        if cfg["encoder"].get("freeze", False):
+            freeze_params(pose_output_layer)
+    else:
+        pose_output_layer = None
+
     model: SignModel = SignModel(
         encoder=encoder,
         gloss_output_layer=gloss_output_layer,
+        pose_output_layer=pose_output_layer,
         decoder=decoder,
         sgn_embed=sgn_embed,
         txt_embed=txt_embed,
@@ -445,8 +532,24 @@ def build_model(
         txt_vocab=txt_vocab,
         do_recognition=do_recognition,
         do_translation=do_translation,
+        do_pose_estimation=do_pose_estimation,
+        right_stream_embed=right_stream_embed
     )
 
+    if cfg.get("pretrained_embeddings", False):
+        embeddings = torch.as_tensor(np.load(cfg["pretrained_embeddings_path"]))
+        new_embeddings = torch.nn.Embedding(embeddings.shape[0], embeddings.shape[1])
+        new_embeddings.weight.data = embeddings
+        new_embeddings.padding_idx = embeddings.shape[1]
+        #print('txt_embed.lut pre',txt_embed.lut.weight.size())
+        txt_embed.lut = new_embeddings#torch.as_tensor(embeddings)
+        #print('embeddings',embeddings.size())
+        #print('txt_embed.lut post',txt_embed.lut.weight.size())
+        with torch.no_grad():
+            #print('model.decoder.output_layer pre',model.decoder.output_layer.weight.shape)
+            model.decoder.output_layer = torch.nn.Linear(embeddings.shape[1], embeddings.shape[0], bias=False)
+            model.decoder.output_layer.weight.copy_(embeddings.clone())
+            
     if do_translation:
         # tie softmax layer with txt embeddings
         if cfg.get("tied_softmax", False):
@@ -461,6 +564,13 @@ def build_model(
                     "hidden_size must be the same."
                     "The decoder must be a Transformer."
                 )
+        if cfg.get("freeze_embeddings", False):
+            for param in txt_embed.lut.parameters():
+                param.requires_grad = False
+            
+            for param in model.decoder.output_layer.parameters():
+                param.requires_grad = False
+               
 
     # custom initialization of model parameters
     initialize_model(model, cfg, txt_padding_idx)

@@ -6,6 +6,10 @@ torch.backends.cudnn.deterministic = True
 import argparse
 import numpy as np
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = '3'
+os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
+os.environ['OMP_NUM_THREADS']='1'
+os.environ['TOKENIZERS_PARALLELISM']='false'
 import shutil
 import time
 import queue
@@ -34,14 +38,14 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchtext.data import Dataset
 from typing import List, Dict
-
+from .tokeniser import Tokeniser
 
 # pylint: disable=too-many-instance-attributes
 class TrainManager:
     """ Manages training loop, validations, learning rate scheduling
     and early stopping."""
 
-    def __init__(self, model: SignModel, config: dict) -> None:
+    def __init__(self, model: SignModel, tokeniser, config: dict) -> None:
         """
         Creates a new TrainManager for a model, specified as in configuration.
 
@@ -65,6 +69,18 @@ class TrainManager:
             if isinstance(config["data"]["feature_size"], list)
             else config["data"]["feature_size"]
         )
+        if config["data"]["concat_pose"]:
+            self.feature_size += (
+                sum(config["data"]["pose_size"])
+                if isinstance(config["data"]["pose_size"], list)
+                else config["data"]["pose_size"]
+            )
+        if config["data"]["concat_flow"]:
+            self.feature_size += (
+                sum(config["data"]["flow_size"])
+                if isinstance(config["data"]["flow_size"], list)
+                else config["data"]["flow_size"]
+            )
         self.dataset_version = config["data"].get("version", "phoenix_2014_trans")
 
         # model
@@ -79,12 +95,22 @@ class TrainManager:
         self.do_translation = (
             config["training"].get("translation_loss_weight", 1.0) > 0.0
         )
+        self.do_pose_estimation = (
+            config["training"].get("pose_loss_weight", 1.0) > 0.0
+        )
+        tokeniser_path = config["data"]["tokeniser_path"]
+
+        """ self.tokeniser = spm.SentencePieceProcessor()
+        self.tokeniser.Load(tokeniser_path) """
+        self.tokeniser = tokeniser 
 
         # Get Recognition and Translation specific parameters
         if self.do_recognition:
             self._get_recognition_params(train_config=train_config)
         if self.do_translation:
             self._get_translation_params(train_config=train_config)
+        if self.do_pose_estimation:
+            self._get_pose_params(train_config=train_config)
 
         # optimization
         self.last_best_lr = train_config.get("learning_rate", -1)
@@ -151,7 +177,7 @@ class TrainManager:
 
         # data & batch handling
         self.level = config["data"]["level"]
-        if self.level not in ["word", "bpe", "char"]:
+        if self.level not in ["word", "bpe", "char", "subword"]:
             raise ValueError("Invalid segmentation level': {}".format(self.level))
 
         self.shuffle = train_config.get("shuffle", True)
@@ -168,6 +194,8 @@ class TrainManager:
                 self.translation_loss_function.cuda()
             if self.do_recognition:
                 self.recognition_loss_function.cuda()
+            """ if self.do_pose_estimation:
+                self.pose_loss_function.cuda() """
 
         # initialize training statistics
         self.steps = 0
@@ -238,6 +266,15 @@ class TrainManager:
         self.translation_max_output_length = train_config.get(
             "translation_max_output_length", None
         )
+
+    def _get_pose_params(self, train_config) -> None:
+        def pose_estimation_function(x, y):
+            """ if use_cuda:
+                pose_loss = pose_loss.cuda() """
+            loss = torch.nn.functional.mse_loss(x, y, reduction='none')
+            return loss[y!=0].sum()
+        self.pose_loss_function = pose_estimation_function
+        self.pose_loss_weight = train_config.get("pose_loss_weight", 1.0)
 
     def _save_checkpoint(self) -> None:
         """
@@ -371,6 +408,8 @@ class TrainManager:
             if self.do_translation:
                 processed_txt_tokens = self.total_txt_tokens
                 epoch_translation_loss = 0
+            if self.do_pose_estimation:
+                epoch_pose_loss = 0
 
             for batch in iter(train_iter):
                 # reactivate training
@@ -392,7 +431,7 @@ class TrainManager:
                 # memory-6794e10db672
                 update = count == 0
 
-                recognition_loss, translation_loss = self._train_batch(
+                recognition_loss, translation_loss, pose_loss = self._train_batch(
                     batch, update=update
                 )
 
@@ -407,6 +446,13 @@ class TrainManager:
                         "train/train_translation_loss", translation_loss, self.steps
                     )
                     epoch_translation_loss += translation_loss.detach().cpu().numpy()
+
+                if self.do_pose_estimation:
+                    self.tb_writer.add_scalar(
+                        "train/train_pose_loss", pose_loss, self.steps
+                    )
+                    
+                    epoch_pose_loss += pose_loss.detach().cpu().numpy()
 
                 count = self.batch_multiplier if update else count
                 count -= 1
@@ -448,6 +494,10 @@ class TrainManager:
                         log_out += "Txt Tokens per Sec: {:8.0f} || ".format(
                             elapsed_txt_tokens / elapsed
                         )
+                    if self.do_pose_estimation:
+                        log_out += "Batch Pose Loss: {:10.6f} => ".format(
+                            pose_loss
+                        )
                     log_out += "Lr: {:.6f}".format(self.optimizer.param_groups[0]["lr"])
                     self.logger.info(log_out)
                     start = time.time()
@@ -462,6 +512,7 @@ class TrainManager:
                     #   Hmm... Future Cihan's problem.
                     val_res = validate_on_data(
                         model=self.model,
+                        tokeniser=self.tokeniser,
                         data=valid_data,
                         batch_size=self.eval_batch_size,
                         use_cuda=self.use_cuda,
@@ -487,6 +538,13 @@ class TrainManager:
                         else None,
                         translation_max_output_length=self.translation_max_output_length
                         if self.do_translation
+                        else None,
+                        do_pose_estimation=self.do_pose_estimation,
+                        pose_loss_function=self.pose_loss_function
+                        if self.do_pose_estimation
+                        else None,
+                        pose_loss_weight=self.pose_loss_weight
+                        if self.do_pose_estimation
                         else None,
                         level=self.level if self.do_translation else None,
                         translation_loss_weight=self.translation_loss_weight
@@ -604,6 +662,7 @@ class TrainManager:
                         "Translation Beam Alpha: %d\n\t"
                         "Recognition Loss: %4.5f\t"
                         "Translation Loss: %4.5f\t"
+                        "Pose loss: %4.5f\t"
                         "PPL: %4.5f\n\t"
                         "Eval Metric: %s\n\t"
                         "WER %3.2f\t(DEL: %3.2f,\tINS: %3.2f,\tSUB: %3.2f)\n\t"
@@ -621,6 +680,9 @@ class TrainManager:
                         else -1,
                         val_res["valid_translation_loss"]
                         if self.do_translation
+                        else -1,
+                        val_res["valid_pose_loss"]
+                        if self.do_pose_estimation
                         else -1,
                         val_res["valid_ppl"] if self.do_translation else -1,
                         self.eval_metric.upper(),
@@ -690,6 +752,8 @@ class TrainManager:
 
                 if self.stop:
                     break
+            
+            print('FIN DEL BUCLE *****************************')
             if self.stop:
                 if (
                     self.scheduler is not None
@@ -710,10 +774,12 @@ class TrainManager:
 
             self.logger.info(
                 "Epoch %3d: Total Training Recognition Loss %.2f "
-                " Total Training Translation Loss %.2f ",
+                " Total Training Translation Loss %.2f "
+                " Total Pose Translation Loss %.2f ",
                 epoch_no + 1,
                 epoch_recognition_loss if self.do_recognition else -1,
                 epoch_translation_loss if self.do_translation else -1,
+                epoch_pose_loss if self.do_pose_estimation else -1,
             )
         else:
             self.logger.info("Training ended after %3d epochs.", epoch_no + 1)
@@ -736,7 +802,7 @@ class TrainManager:
         :return normalized_translation_loss: Normalized translation loss
         """
 
-        recognition_loss, translation_loss = self.model.get_loss_for_batch(
+        recognition_loss, translation_loss, pose_loss = self.model.get_loss_for_batch(
             batch=batch,
             recognition_loss_function=self.recognition_loss_function
             if self.do_recognition
@@ -744,11 +810,17 @@ class TrainManager:
             translation_loss_function=self.translation_loss_function
             if self.do_translation
             else None,
+            pose_loss_function=self.pose_loss_function
+            if self.do_pose_estimation
+            else None,
             recognition_loss_weight=self.recognition_loss_weight
             if self.do_recognition
             else None,
             translation_loss_weight=self.translation_loss_weight
             if self.do_translation
+            else None,
+            pose_loss_weight=self.pose_loss_weight
+            if self.do_pose_estimation
             else None,
         )
 
@@ -776,7 +848,14 @@ class TrainManager:
         else:
             normalized_recognition_loss = 0
 
-        total_loss = normalized_recognition_loss + normalized_translation_loss
+        if self.do_pose_estimation:
+            normalized_pose_loss = pose_loss / (
+                self.batch_multiplier * txt_normalization_factor
+            )
+        else:
+            normalized_pose_loss = 0
+
+        total_loss = normalized_recognition_loss + normalized_translation_loss + normalized_pose_loss
         # compute gradients
         total_loss.backward()
 
@@ -798,7 +877,7 @@ class TrainManager:
         if self.do_translation:
             self.total_txt_tokens += batch.num_txt_tokens
 
-        return normalized_recognition_loss, normalized_translation_loss
+        return normalized_recognition_loss, normalized_translation_loss, normalized_pose_loss
 
     def _add_report(
         self,
@@ -974,26 +1053,52 @@ def train(cfg_file: str) -> None:
     # set the random seed
     set_seed(seed=cfg["training"].get("random_seed", 42))
 
+    tokeniser = Tokeniser(cfg['data'])
+
     train_data, dev_data, test_data, gls_vocab, txt_vocab = load_data(
-        data_cfg=cfg["data"]
+        data_cfg=cfg["data"], tokeniser=tokeniser
     )
+
+    sgn_dim = (
+        sum(cfg["data"]["feature_size"])
+        if isinstance(cfg["data"]["feature_size"], list)
+        else cfg["data"]["feature_size"]
+    )
+    if cfg["data"]["concat_pose"]:
+        sgn_dim += (
+            sum(cfg["data"]["pose_size"])
+            if isinstance(cfg["data"]["pose_size"], list)
+            else cfg["data"]["pose_size"]
+        )
+    if cfg["data"]["concat_flow"]:
+        sgn_dim += (
+            sum(cfg["data"]["flow_size"])
+            if isinstance(cfg["data"]["flow_size"], list)
+            else cfg["data"]["flow_size"]
+        )
 
     # build model and load parameters into it
     do_recognition = cfg["training"].get("recognition_loss_weight", 1.0) > 0.0
     do_translation = cfg["training"].get("translation_loss_weight", 1.0) > 0.0
+    do_pose_estimation = cfg["training"].get("pose_loss_weight", 1.0) > 0.0
+    right_stream_dim = None
+    if cfg["data"]["pose_stream"]:
+        right_stream_dim = cfg["data"]["pose_size"]
+    elif cfg["data"]["flow_stream"]:
+        right_stream_dim = cfg["data"]["flow_size"]
     model = build_model(
         cfg=cfg["model"],
         gls_vocab=gls_vocab,
         txt_vocab=txt_vocab,
-        sgn_dim=sum(cfg["data"]["feature_size"])
-        if isinstance(cfg["data"]["feature_size"], list)
-        else cfg["data"]["feature_size"],
+        sgn_dim=sgn_dim,
         do_recognition=do_recognition,
         do_translation=do_translation,
+        do_pose_estimation=do_pose_estimation,
+        right_stream_dim=right_stream_dim
     )
 
     # for training management, e.g. early stopping and model selection
-    trainer = TrainManager(model=model, config=cfg)
+    trainer = TrainManager(model=model, tokeniser=tokeniser, config=cfg)
 
     # store copy of original training config in model dir
     shutil.copy2(cfg_file, trainer.model_dir + "/config.yaml")
