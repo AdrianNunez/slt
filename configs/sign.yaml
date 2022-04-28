@@ -18,12 +18,17 @@ data:
     random_dev_subset: -1
     tokeniser_path: data/tokeniser/tok.model
     txt_vocab: data/vocabulary.txt
-    tokeniser_file: ../mbart.cc25.v2/sentence.bpe.model
+    tokeniser_file: ../../mbart.cc25.v2/sentence.bpe.model
     pose_stream: false
     flow_stream: false
     concat_pose: false
     concat_flow: false
     normalise_before_concat: false
+    flow_options:
+        copy_first: false
+        copy_last: false
+        zeros_first: false
+        zeros_last: false
 testing:
     recognition_beam_sizes:
     - 1
