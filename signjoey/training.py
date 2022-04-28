@@ -753,7 +753,6 @@ class TrainManager:
                 if self.stop:
                     break
             
-            print('FIN DEL BUCLE *****************************')
             if self.stop:
                 if (
                     self.scheduler is not None

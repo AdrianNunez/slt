@@ -98,7 +98,14 @@ class SignTranslationDataset(data.Dataset):
                 ), dim=1)
             if cfg["concat_flow"]:
                 #flow = torch.cat((torch.zeros(1, sample["flow"].size(-1)), sample["flow"]), dim=0)
-                flow = torch.cat((sample["flow"][:1,:], sample["flow"]), dim=0)
+                if cfg["flow_options"]["copy_first"]:
+                    flow = torch.cat((sample["flow"][:1,:], sample["flow"]), dim=0)
+                elif cfg["flow_options"]["copy_last"]:
+                    flow = torch.cat((sample["flow"], sample["flow"][-1:,:]), dim=0)
+                elif cfg["flow_options"]["zeros_first"]:
+                    flow = torch.cat((torch.zeros(1,sample["flow"].size(-1)), sample["flow"]), dim=0)
+                elif cfg["flow_options"]["zeros_last"]:
+                    flow = torch.cat((sample["flow"], torch.zeros(1,sample["flow"].size(-1))), dim=0)
                 l[2] = torch.cat((
                     torch.nn.functional.normalize(l[2], dim=-1)
                     if normalise_before_concat else l[2], 
